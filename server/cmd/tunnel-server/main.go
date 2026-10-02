@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -11,12 +12,29 @@ import (
 	"time"
 
 	"internet-bonding/protocol"
+	"internet-bonding/server/internal/session"
 )
 
 func main() {
 	port := flag.Int("port", 51820, "UDP port to listen on")
 	bindIP := flag.String("bind", "0.0.0.0", "IP address to bind UDP listener")
+	pskHex := flag.String("psk", "", "Hex-encoded 32-byte Pre-Shared Key (or set BONDING_PSK env)")
 	flag.Parse()
+
+	// Resolve PSK from flag or environment variable
+	var psk []byte
+	pskStr := *pskHex
+	if pskStr == "" {
+		pskStr = os.Getenv("BONDING_PSK")
+	}
+
+	if pskStr != "" {
+		decoded, err := hex.DecodeString(pskStr)
+		if err != nil || len(decoded) != 32 {
+			log.Fatalf("Invalid PSK: must be a 64-character hex string (32 bytes)")
+		}
+		psk = decoded
+	}
 
 	addrStr := fmt.Sprintf("%s:%d", *bindIP, *port)
 	addr, err := net.ResolveUDPAddr("udp4", addrStr)
@@ -30,10 +48,17 @@ func main() {
 	}
 	defer conn.Close()
 
+	sessionTable := session.NewSessionTable()
+
 	fmt.Println("==================================================")
 	fmt.Println("     True Internet Bonding: VPS Tunnel Server     ")
 	fmt.Println("==================================================")
 	fmt.Printf("Listening for UDP tunnel packets on %s\n", addrStr)
+	if len(psk) > 0 {
+		fmt.Println("Security: HMAC-SHA256 authentication enabled (PSK loaded)")
+	} else {
+		fmt.Println("Security: Running in compatibility mode (no PSK configured)")
+	}
 	fmt.Println("Press Ctrl+C to stop.")
 	fmt.Println()
 
@@ -53,7 +78,6 @@ func main() {
 	for {
 		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			// Check if connection closed
 			select {
 			case <-sigChan:
 				return
@@ -65,28 +89,61 @@ func main() {
 
 		var pkt protocol.Packet
 		if err := pkt.UnmarshalBinary(buf[:n]); err != nil {
-			log.Printf("[DROP] Invalid packet from %s: %v", clientAddr, err)
+			log.Printf("[DROP] Malformed packet from %s: %v", clientAddr, err)
 			continue
 		}
 
 		totalPackets++
 		transitTime := time.Since(pkt.Timestamp)
 
-		// Echo packet back to client
+		// Handle Version 2 (Phase 3B Multi-Path with Session & HMAC)
+		if pkt.Version == protocol.ProtocolVersion2 {
+			resp, err := sessionTable.ProcessPacket(&pkt, clientAddr, psk)
+			if err != nil {
+				log.Printf("[SECURITY DROP] Failed authentication from %s: %v (Total drops: %d)",
+					clientAddr, err, sessionTable.SecurityDropCount())
+				continue
+			}
+
+			respBytes, err := resp.MarshalBinary()
+			if err != nil {
+				log.Printf("[ERROR] Failed to marshal V2 response: %v", err)
+				continue
+			}
+
+			_, err = conn.WriteToUDP(respBytes, clientAddr)
+			if err != nil {
+				log.Printf("[ERROR] Failed to send V2 response to %s: %v", clientAddr, err)
+				continue
+			}
+
+			fmt.Printf("[%s] V2 Resp: Session=%016X Path=%d Seq=%-4d Client=%-21s | Drops: %d | Total: %d\n",
+				time.Now().Format("15:04:05.000"),
+				pkt.SessionID,
+				pkt.PathID,
+				pkt.SeqNum,
+				clientAddr.String(),
+				sessionTable.SecurityDropCount(),
+				totalPackets,
+			)
+			continue
+		}
+
+		// Handle Version 1 (Phase 3A Backward Compatibility)
 		pkt.Type = protocol.PacketTypeEcho
 		respBytes, err := pkt.MarshalBinary()
 		if err != nil {
-			log.Printf("[ERROR] Failed to marshal echo response for seq=%d: %v", pkt.SeqNum, err)
+			log.Printf("[ERROR] Failed to marshal V1 echo for seq=%d: %v", pkt.SeqNum, err)
 			continue
 		}
 
 		_, err = conn.WriteToUDP(respBytes, clientAddr)
 		if err != nil {
-			log.Printf("[ERROR] Failed to send echo to %s: %v", clientAddr, err)
+			log.Printf("[ERROR] Failed to send V1 echo to %s: %v", clientAddr, err)
 			continue
 		}
 
-		fmt.Printf("[%s] Echoed Seq=%-4d to Client=%-21s | Payload=%-3d bytes | One-way: %s | Total: %d\n",
+		fmt.Printf("[%s] V1 Echo: Seq=%-4d to Client=%-21s | Payload=%-3d bytes | One-way: %s | Total: %d\n",
 			time.Now().Format("15:04:05.000"),
 			pkt.SeqNum,
 			clientAddr.String(),
