@@ -24,6 +24,13 @@ func GenerateSessionID() uint64 {
 	return id
 }
 
+// TxItem represents a queued datagram destined for physical transmission.
+type TxItem struct {
+	Raw  []byte
+	Size int
+	Seq  uint32
+}
+
 // ManagedPath represents an interface-agnostic physical tunnel path within a bonding session.
 type ManagedPath struct {
 	PathID      uint8
@@ -35,6 +42,12 @@ type ManagedPath struct {
 	packetsSent uint64
 	bytesRecv   uint64
 	packetsRecv uint64
+
+	txQueue    chan TxItem
+	workerStop chan struct{}
+	workerDone sync.WaitGroup
+	workerMu   sync.Mutex
+	workerRun  bool
 }
 
 func (mp *ManagedPath) NextSeq() uint32 {
@@ -75,6 +88,100 @@ func (mp *ManagedPath) WriteRaw(data []byte, addr *net.UDPAddr) (int, error) {
 		return 0, fmt.Errorf("path %d socket not bound", mp.PathID)
 	}
 	return mp.Tunnel.conn.WriteTo(data, addr)
+}
+
+// StartTxWorker initializes a bounded TX queue and launches a dedicated path transmission worker.
+func (mp *ManagedPath) StartTxWorker(remoteAddr *net.UDPAddr, queueCap int) {
+	mp.workerMu.Lock()
+	defer mp.workerMu.Unlock()
+
+	if mp.workerRun {
+		return
+	}
+	if queueCap <= 0 {
+		queueCap = 512
+	}
+	mp.txQueue = make(chan TxItem, queueCap)
+	mp.workerStop = make(chan struct{})
+	mp.workerRun = true
+
+	mp.workerDone.Add(1)
+	go func() {
+		defer mp.workerDone.Done()
+		for {
+			select {
+			case <-mp.workerStop:
+				// Drain any remaining packets
+				for {
+					select {
+					case item := <-mp.txQueue:
+						_, _ = mp.WriteRaw(item.Raw, remoteAddr)
+						mp.RecordTx(item.Size)
+					default:
+						return
+					}
+				}
+			case item, ok := <-mp.txQueue:
+				if !ok {
+					return
+				}
+				_, err := mp.WriteRaw(item.Raw, remoteAddr)
+				if err == nil {
+					mp.RecordTx(item.Size)
+				} else {
+					mp.Health.RecordProbeResult(false, 0, err)
+				}
+			}
+		}
+	}()
+}
+
+// StopTxWorker gracefully stops the path's transmission worker and drains pending items.
+func (mp *ManagedPath) StopTxWorker() {
+	mp.workerMu.Lock()
+	if !mp.workerRun {
+		mp.workerMu.Unlock()
+		return
+	}
+	mp.workerRun = false
+	close(mp.workerStop)
+	mp.workerMu.Unlock()
+	mp.workerDone.Wait()
+}
+
+// TxQueueDepth returns the current number of packets buffered in this path's TX queue.
+func (mp *ManagedPath) TxQueueDepth() int {
+	if mp.txQueue == nil {
+		return 0
+	}
+	return len(mp.txQueue)
+}
+
+// TryEnqueueTx attempts non-blocking submission of a packet to this path's worker queue.
+// Returns false if queue is saturated or worker is not running.
+func (mp *ManagedPath) TryEnqueueTx(raw []byte, size int, seq uint32) bool {
+	if mp.txQueue == nil {
+		return false
+	}
+	select {
+	case mp.txQueue <- TxItem{Raw: raw, Size: size, Seq: seq}:
+		return true
+	default:
+		return false
+	}
+}
+
+// EnqueueTxOrBlock submits a packet to the TX queue with a timeout to apply backpressure.
+func (mp *ManagedPath) EnqueueTxOrBlock(raw []byte, size int, seq uint32, timeout time.Duration) bool {
+	if mp.txQueue == nil {
+		return false
+	}
+	select {
+	case mp.txQueue <- TxItem{Raw: raw, Size: size, Seq: seq}:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // TunnelManager coordinates multiple dynamic physical tunnels under a unified SessionID.
@@ -278,11 +385,23 @@ func (tm *TunnelManager) SendProbe(pathID uint8, payload []byte) (*protocol.Pack
 	}
 }
 
-// Close releases all open socket connections across all managed paths.
+// StartAllTxWorkers starts dedicated asynchronous transmit workers for all active paths.
+func (tm *TunnelManager) StartAllTxWorkers(queueCap int) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	for _, p := range tm.paths {
+		if p.Tunnel != nil {
+			p.StartTxWorker(tm.remoteAddr, queueCap)
+		}
+	}
+}
+
+// Close releases all open socket connections and stops all TX workers across all managed paths.
 func (tm *TunnelManager) Close() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	for _, p := range tm.paths {
+		p.StopTxWorker()
 		if p.Tunnel != nil {
 			_ = p.Tunnel.Close()
 		}

@@ -26,6 +26,12 @@ func NewClientTunnel(cfg TunnelConfig) (*ClientTunnel, error) {
 		return nil, err
 	}
 
+	if udpConn, ok := conn.(*net.UDPConn); ok {
+		const targetBuf = 4 * 1024 * 1024
+		_ = udpConn.SetReadBuffer(targetBuf)
+		_ = udpConn.SetWriteBuffer(targetBuf)
+	}
+
 	return &ClientTunnel{
 		cfg:     cfg,
 		conn:    conn,

@@ -112,6 +112,9 @@ func main() {
 	}
 	defer tm.Close()
 
+	// Start asynchronous per-path transmit workers (512 packet queue capacity each)
+	tm.StartAllTxWorkers(512)
+
 	fmt.Printf("Session Established: SessionID=0x%016X\n", tm.SessionID())
 
 	// 5. Initialize Components: Scheduler, ReorderBuffer, RouteManager
@@ -458,37 +461,45 @@ func main() {
 				continue
 			}
 
-			_, err = selectedPath.WriteRaw(raw, remoteAddr)
-			if err == nil {
-				selectedPath.RecordTx(n)
+			// Non-blocking submission to selected path's asynchronous TX worker queue
+			if selectedPath.TryEnqueueTx(raw, n, seq) {
 				sentCount := atomic.AddUint64(&metrics.DataPacketsSent, 1)
-				if sentCount <= 20 || sentCount%50 == 0 {
-					fmt.Printf("[%s] [SCHEDULER] DATA seq=%d (%dB) -> P%d (%s) (Total: %d)\n",
-						time.Now().Format("15:04:05.000"), seq, n, selectedPath.PathID, selectedPath.Interface.Name, sentCount)
+				if sentCount <= 20 || sentCount%100 == 0 {
+					fmt.Printf("[%s] [SCHEDULER] DATA seq=%d (%dB) -> P%d (%s) [Q=%d/512] (Total: %d)\n",
+						time.Now().Format("15:04:05.000"), seq, n, selectedPath.PathID, selectedPath.Interface.Name, selectedPath.TxQueueDepth(), sentCount)
 				}
-			} else {
-				// Immediate failover for failed socket write: record failure on degraded path
-				selectedPath.Health.RecordProbeResult(false, 0, err)
+				continue
+			}
 
-				// Attempt failover to any remaining active path
-				for _, altPath := range tm.Paths() {
-					if altPath.PathID != selectedPath.PathID {
-						st, _, _ := altPath.Health.SchedulingMetrics()
-						if st == tunnel.StatusUp || st == tunnel.StatusDegraded {
-							altPkt := protocol.NewDataPacket(tm.SessionID(), altPath.PathID, seq, wintunBuf[:n], psk)
-							if altRaw, altErr := altPkt.MarshalBinary(); altErr == nil {
-								if _, altWriteErr := altPath.WriteRaw(altRaw, remoteAddr); altWriteErr == nil {
-									altPath.RecordTx(n)
-									sentCount := atomic.AddUint64(&metrics.DataPacketsSent, 1)
-									if sentCount <= 20 || sentCount%50 == 0 {
-										fmt.Printf("[%s] [SCHEDULER] DATA seq=%d (%dB) -> P%d (%s) [FAILOVER] (Total: %d)\n",
-											time.Now().Format("15:04:05.000"), seq, n, altPath.PathID, altPath.Interface.Name, sentCount)
-									}
-									break
+			// Selected path queue saturated: divert packet to alternate active path without dropping
+			diverted := false
+			for _, altPath := range tm.Paths() {
+				if altPath.PathID != selectedPath.PathID {
+					st, _, _, _, avail := altPath.Health.QualityMetrics()
+					if avail && (st == tunnel.StatusUp || st == tunnel.StatusDegraded) {
+						altPkt := protocol.NewDataPacket(tm.SessionID(), altPath.PathID, seq, wintunBuf[:n], psk)
+						if altRaw, altErr := altPkt.MarshalBinary(); altErr == nil {
+							if altPath.TryEnqueueTx(altRaw, n, seq) {
+								sentCount := atomic.AddUint64(&metrics.DataPacketsSent, 1)
+								if sentCount <= 20 || sentCount%50 == 0 {
+									fmt.Printf("[%s] [SCHEDULER] DATA seq=%d (%dB) -> P%d (%s) [DIVERT P%d Q-FULL] (Total: %d)\n",
+										time.Now().Format("15:04:05.000"), seq, n, altPath.PathID, altPath.Interface.Name, selectedPath.PathID, sentCount)
 								}
+								diverted = true
+								break
 							}
 						}
 					}
+				}
+			}
+
+			if !diverted {
+				// All active queues temporarily saturated: apply bounded backpressure (up to 50ms)
+				if selectedPath.EnqueueTxOrBlock(raw, n, seq, 50*time.Millisecond) {
+					atomic.AddUint64(&metrics.DataPacketsSent, 1)
+				} else {
+					// Drop packet after backpressure timeout to prevent unbounded buffer growth
+					atomic.AddUint64(&metrics.SecurityDrops, 1)
 				}
 			}
 		}
@@ -501,6 +512,8 @@ func main() {
 	var lastStatusTime time.Time = time.Now()
 	var lastTxBytes uint64
 	var lastRxBytes uint64
+	lastPathTxBytes := make(map[uint8]uint64)
+	lastPathRxBytes := make(map[uint8]uint64)
 
 	for {
 		select {
@@ -514,15 +527,18 @@ func main() {
 			}
 
 			type pathInfo struct {
-				p      *tunnel.ManagedPath
-				st     tunnel.PathStatus
-				srtt   time.Duration
-				loss   float64
-				weight int
-				txB    uint64
-				txP    uint64
-				rxB    uint64
-				rxP    uint64
+				p          *tunnel.ManagedPath
+				st         tunnel.PathStatus
+				srtt       time.Duration
+				loss       float64
+				weight     int
+				txB        uint64
+				txP        uint64
+				rxB        uint64
+				rxP        uint64
+				qDepth     int
+				txRateMbps float64
+				rxRateMbps float64
 			}
 
 			var pathsInfo []pathInfo
@@ -540,16 +556,26 @@ func main() {
 				totalRxBytes += rxB
 				totalRxPkts += rxP
 
+				prevTx := lastPathTxBytes[p.PathID]
+				prevRx := lastPathRxBytes[p.PathID]
+				pTxRate := float64((txB-prevTx)*8) / (elapsed * 1_000_000)
+				pRxRate := float64((rxB-prevRx)*8) / (elapsed * 1_000_000)
+				lastPathTxBytes[p.PathID] = txB
+				lastPathRxBytes[p.PathID] = rxB
+
 				pathsInfo = append(pathsInfo, pathInfo{
-					p:      p,
-					st:     st,
-					srtt:   srtt,
-					loss:   loss,
-					weight: w,
-					txB:    txB,
-					txP:    txP,
-					rxB:    rxB,
-					rxP:    rxP,
+					p:          p,
+					st:         st,
+					srtt:       srtt,
+					loss:       loss,
+					weight:     w,
+					txB:        txB,
+					txP:        txP,
+					rxB:        rxB,
+					rxP:        rxP,
+					qDepth:     p.TxQueueDepth(),
+					txRateMbps: pTxRate,
+					rxRateMbps: pRxRate,
 				})
 			}
 
@@ -567,8 +593,8 @@ func main() {
 
 			var pathDetails []string
 			for _, pi := range pathsInfo {
-				pathDetails = append(pathDetails, fmt.Sprintf("P%d(%s): %-8s RTT=%5.1fms Loss=%4.1f%% W=%-2d",
-					pi.p.PathID, pi.p.Interface.Name, pi.st, float64(pi.srtt.Milliseconds()), pi.loss, pi.weight))
+				pathDetails = append(pathDetails, fmt.Sprintf("P%d(%s): %-8s RTT=%5.1fms Loss=%4.1f%% W=%-2d Q=%d/512",
+					pi.p.PathID, pi.p.Interface.Name, pi.st, float64(pi.srtt.Milliseconds()), pi.loss, pi.weight, pi.qDepth))
 			}
 			fmt.Printf("  PATHS: %s\n", strings.Join(pathDetails, " | "))
 
@@ -578,8 +604,8 @@ func main() {
 				if totalTxBytes > 0 {
 					share = float64(pi.txB) / float64(totalTxBytes) * 100.0
 				}
-				txParts = append(txParts, fmt.Sprintf("P%d: %s (%d pkts, %4.1f%%)",
-					pi.p.PathID, formatBytes(pi.txB), pi.txP, share))
+				txParts = append(txParts, fmt.Sprintf("P%d: %s (%d pkts, %4.1f%%, %5.2f Mbps)",
+					pi.p.PathID, formatBytes(pi.txB), pi.txP, share, pi.txRateMbps))
 			}
 			fmt.Printf("  TX:    %s (%d pkts) | %s\n", formatBytes(totalTxBytes), totalTxPkts, strings.Join(txParts, " | "))
 
@@ -589,13 +615,13 @@ func main() {
 				if totalRxBytes > 0 {
 					share = float64(pi.rxB) / float64(totalRxBytes) * 100.0
 				}
-				rxParts = append(rxParts, fmt.Sprintf("P%d: %s (%d pkts, %4.1f%%)",
-					pi.p.PathID, formatBytes(pi.rxB), pi.rxP, share))
+				rxParts = append(rxParts, fmt.Sprintf("P%d: %s (%d pkts, %4.1f%%, %5.2f Mbps)",
+					pi.p.PathID, formatBytes(pi.rxB), pi.rxP, share, pi.rxRateMbps))
 			}
 			fmt.Printf("  RX:    %s (%d pkts) | %s\n", formatBytes(totalRxBytes), totalRxPkts, strings.Join(rxParts, " | "))
 
-			fmt.Printf("  QUEUE: Reorder(Recv=%d, Reord=%d, Drop=%d, Deliv=%d) | Wintun(In=%d, Out=%d, Drop=%d)\n",
-				rStats.Received, rStats.Reordered, rStats.Dropped, rStats.Delivered,
+			fmt.Printf("  QUEUE: Reorder(Q=%d, Recv=%d, Reord=%d, Drop=%d, Dupl=%d, Deliv=%d) | Wintun(In=%d, Out=%d, Drops=%d)\n",
+				rStats.QueueDepth, rStats.Received, rStats.Reordered, rStats.Dropped, rStats.Duplicates, rStats.Delivered,
 				atomic.LoadUint64(&metrics.IPPacketsFromWintun),
 				atomic.LoadUint64(&metrics.IPPacketsToWintun),
 				atomic.LoadUint64(&metrics.SecurityDrops),

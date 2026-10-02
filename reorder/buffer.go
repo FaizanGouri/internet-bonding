@@ -19,6 +19,7 @@ type ReorderStats struct {
 	Duplicates uint64
 	Dropped    uint64
 	Delivered  uint64
+	QueueDepth int
 }
 
 // packetEntry holds a buffered packet and its arrival timestamp.
@@ -74,13 +75,25 @@ func (rb *ReorderBuffer) SetNextExpectedSeq(seq uint32) {
 
 // Stats returns a snapshot of reorder buffer counters.
 func (rb *ReorderBuffer) Stats() ReorderStats {
+	rb.mu.Lock()
+	depth := len(rb.buffer)
+	rb.mu.Unlock()
+
 	return ReorderStats{
 		Received:   atomic.LoadUint64(&rb.received),
 		Reordered:  atomic.LoadUint64(&rb.reordered),
 		Duplicates: atomic.LoadUint64(&rb.duplicates),
 		Dropped:    atomic.LoadUint64(&rb.dropped),
 		Delivered:  atomic.LoadUint64(&rb.delivered),
+		QueueDepth: depth,
 	}
+}
+
+// QueueDepth returns the current number of out-of-order packets waiting in the reorder buffer.
+func (rb *ReorderBuffer) QueueDepth() int {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	return len(rb.buffer)
 }
 
 // Insert processes an incoming packet with its sequence number and returns any packets ready for delivery in order.

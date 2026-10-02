@@ -88,6 +88,15 @@ func main() {
 	}
 	defer conn.Close()
 
+	// Expand socket buffers to 4 MB for high-throughput bonding
+	const targetBuf = 4 * 1024 * 1024
+	if err := conn.SetReadBuffer(targetBuf); err != nil {
+		log.Printf("[WARN] Failed to set server UDP read buffer: %v", err)
+	}
+	if err := conn.SetWriteBuffer(targetBuf); err != nil {
+		log.Printf("[WARN] Failed to set server UDP write buffer: %v", err)
+	}
+
 	sessionTable := session.NewSessionTable()
 
 	fmt.Println("==================================================")

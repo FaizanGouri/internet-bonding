@@ -54,6 +54,22 @@ func NewClientTunnel(cfg TunnelConfig) (*ClientTunnel, error) {
 		return nil, fmt.Errorf("failed to bind UDP socket to %s with IP_UNICAST_IF=%d: %w", bindAddr, cfg.IfIndex, err)
 	}
 
+	// Expand socket buffers to 4 MB for high-throughput bonding
+	const targetBuf = 4 * 1024 * 1024
+	if udpConn, ok := conn.(*net.UDPConn); ok {
+		_ = udpConn.SetReadBuffer(targetBuf)
+		_ = udpConn.SetWriteBuffer(targetBuf)
+		if rawConn, err := udpConn.SyscallConn(); err == nil {
+			var rcvBuf, sndBuf int
+			_ = rawConn.Control(func(fd uintptr) {
+				rcvBuf, _ = windows.GetsockoptInt(windows.Handle(fd), windows.SOL_SOCKET, windows.SO_RCVBUF)
+				sndBuf, _ = windows.GetsockoptInt(windows.Handle(fd), windows.SOL_SOCKET, windows.SO_SNDBUF)
+			})
+			fmt.Printf("[TUNNEL] Interface %s (IfIndex %d) socket buffers: RCV=%d KB, SND=%d KB\n",
+				cfg.InterfaceName, cfg.IfIndex, rcvBuf/1024, sndBuf/1024)
+		}
+	}
+
 	return &ClientTunnel{
 		cfg:     cfg,
 		conn:    conn,
