@@ -140,8 +140,10 @@ func (ph *PathHealth) RecordProbeResult(success bool, rtt time.Duration, err err
 			ph.Jitter = time.Duration(0.875*float64(ph.Jitter) + 0.125*diff)
 		}
 	} else {
-		ph.ConsecutiveSuccesses = 0
 		ph.ConsecutiveFailures++
+		if ph.ConsecutiveFailures >= 3 {
+			ph.ConsecutiveSuccesses = 0
+		}
 		if err != nil {
 			ph.LastError = err.Error()
 		} else {
@@ -159,14 +161,14 @@ func (ph *PathHealth) RecordProbeResult(success bool, rtt time.Duration, err err
 	case StatusUp:
 		if ph.ConsecutiveFailures >= 3 {
 			ph.Status = StatusDown
-		} else if ph.LossPercent > 15.0 || ph.SRTT > 250*time.Millisecond {
+		} else if ph.LossPercent > 15.0 || ph.SRTT > 280*time.Millisecond {
 			ph.Status = StatusDegraded
 		}
 
 	case StatusDegraded:
 		if ph.ConsecutiveFailures >= 3 {
 			ph.Status = StatusDown
-		} else if ph.LossPercent <= 10.0 && ph.SRTT <= 200*time.Millisecond && ph.ConsecutiveSuccesses >= 10 {
+		} else if ph.LossPercent <= 10.0 && ph.SRTT <= 250*time.Millisecond && ph.ConsecutiveSuccesses >= 5 {
 			ph.Status = StatusUp
 		}
 

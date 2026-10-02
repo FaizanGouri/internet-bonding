@@ -304,7 +304,7 @@ func (st *SessionTable) ProcessIncomingPacket(pkt *protocol.Packet, clientAddr *
 			CreatedAt:      now,
 			LastActivity:   now,
 			Paths:          make(map[uint8]*PathEndpoint),
-			ReorderBuffer:  reorder.NewReorderBuffer(40 * time.Millisecond),
+			ReorderBuffer:  reorder.NewReorderBuffer(reorder.DefaultReorderTimeout),
 			currentWeights: make(map[uint8]int),
 		}
 		st.sessions[pkt.SessionID] = sess

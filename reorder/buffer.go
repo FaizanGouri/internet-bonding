@@ -7,7 +7,8 @@ import (
 )
 
 // DefaultReorderTimeout is the default duration to wait for a missing sequence number before skipping the gap.
-const DefaultReorderTimeout = 40 * time.Millisecond
+// Set to 250ms to accommodate asymmetric WAN latency differentials (e.g. Wi-Fi ~30ms vs Cellular ~185ms).
+const DefaultReorderTimeout = 250 * time.Millisecond
 
 // DefaultMaxBufferSize is the maximum number of out-of-order packets retained before forcing a flush.
 const DefaultMaxBufferSize = 512

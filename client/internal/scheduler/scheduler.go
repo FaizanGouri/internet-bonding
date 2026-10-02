@@ -14,13 +14,25 @@ type Scheduler struct {
 	mu             sync.Mutex
 	dataSeqNum     uint32
 	currentWeights map[uint8]int
+	manualWeights  map[uint8]int
 }
 
 // NewScheduler creates an initialized multi-path packet scheduler.
 func NewScheduler() *Scheduler {
 	return &Scheduler{
 		currentWeights: make(map[uint8]int),
+		manualWeights:  make(map[uint8]int),
 	}
+}
+
+// SetManualWeight configures an explicit manual weight for a path ID.
+func (s *Scheduler) SetManualWeight(pathID uint8, weight int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.manualWeights == nil {
+		s.manualWeights = make(map[uint8]int)
+	}
+	s.manualWeights[pathID] = weight
 }
 
 // NextDataSeqNum returns the next monotonically increasing sequence number for data packets.
@@ -36,6 +48,30 @@ func CalculateWeight(status tunnel.PathStatus, srtt time.Duration) int {
 // CalculateWeightWithRamp determines scheduling weight, incorporating a slow-start ramp-up for recovered paths.
 func CalculateWeightWithRamp(status tunnel.PathStatus, srtt time.Duration, consecutiveSuccesses int) int {
 	return CalculateWeightWithQuality(status, srtt, 0.0, consecutiveSuccesses)
+}
+
+// CalculateWeightWithManual determines scheduling weight, respecting an explicit manual weight override if positive.
+func CalculateWeightWithManual(status tunnel.PathStatus, srtt time.Duration, lossPercent float64, consecutiveSuccesses int, manualWeight int) int {
+	if manualWeight > 0 {
+		switch status {
+		case tunnel.StatusUp:
+			return manualWeight
+		case tunnel.StatusDegraded:
+			// If degraded latency exceeds the reorder buffer window (> 380ms) or severe loss (> 20%),
+			// exclude from active striping to prevent Head-of-Line blocking and TCP collapse.
+			if srtt > 380*time.Millisecond || lossPercent > 20.0 {
+				return 0
+			}
+			d := manualWeight / 3
+			if d < 1 {
+				d = 1
+			}
+			return d
+		default:
+			return 0
+		}
+	}
+	return CalculateWeightWithQuality(status, srtt, lossPercent, consecutiveSuccesses)
 }
 
 // CalculateWeightWithQuality determines scheduling weight based on status, RTT, packet loss, and recovery stage.
@@ -55,13 +91,15 @@ func CalculateWeightWithQuality(status tunnel.PathStatus, srtt time.Duration, lo
 		if ms < 10 {
 			ms = 10
 		}
-		// Base weight inversely proportional to latency: weight = clamp(floor(500 / ms), 1, 10)
-		base := int(math.Floor(500.0 / ms))
-		if base < 1 {
-			base = 1
-		}
-		if base > 10 {
+		var base int
+		if ms <= 180 {
 			base = 10
+		} else if ms <= 240 {
+			base = 3
+		} else {
+			// Higher latency mobile/cellular link (> 240ms)
+			// Safe baseline is weight 1 to prevent bufferbloat and Head-of-Line blocking on fast Wi-Fi
+			base = 1
 		}
 
 		// Account for packet loss if present (e.g. 5% loss reduces capacity factor)
@@ -88,7 +126,11 @@ func CalculateWeightWithQuality(status tunnel.PathStatus, srtt time.Duration, lo
 		return base
 
 	case tunnel.StatusDegraded:
-		// Degraded path gets reduced weight proportional to quality, not completely discarded
+		// Degraded path gets reduced weight proportional to quality.
+		// If latency exceeds reorder window (> 380ms) or severe packet loss (> 20%), exclude to prevent HoL blocking.
+		if srtt > 380*time.Millisecond || lossPercent > 20.0 {
+			return 0
+		}
 		if srtt <= 0 {
 			return 1
 		}
@@ -152,7 +194,11 @@ func (s *Scheduler) SelectPath(paths []*tunnel.ManagedPath) *tunnel.ManagedPath 
 		if !available {
 			continue
 		}
-		weight := CalculateWeightWithQuality(status, srtt, loss, consec)
+		manualW := 0
+		if s.manualWeights != nil {
+			manualW = s.manualWeights[p.PathID]
+		}
+		weight := CalculateWeightWithManual(status, srtt, loss, consec, manualW)
 		if weight > 0 {
 			eligible = append(eligible, eligiblePath{path: p, weight: weight})
 			totalWeight += weight

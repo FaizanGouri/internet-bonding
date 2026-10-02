@@ -29,7 +29,9 @@ const ProbeTimeoutThreshold = 2500 * time.Millisecond
 
 type ClientMetrics struct {
 	IPPacketsFromWintun uint64
+	IPBytesFromWintun   uint64
 	IPPacketsToWintun   uint64
+	IPBytesToWintun     uint64
 	DataPacketsSent     uint64
 	DataPacketsRecv     uint64
 	SecurityDrops       uint64
@@ -43,6 +45,8 @@ func main() {
 	vpsIP := flag.String("vps-ip", "10.8.0.1", "VPS virtual tunnel gateway IP")
 	mtu := flag.Int("mtu", 1400, "Virtual adapter MTU")
 	extraRoutes := flag.String("extra-routes", "", "Comma-separated extra CIDRs to route into tunnel (e.g. 1.1.1.1/32)")
+	p1WeightFlag := flag.Int("p1-weight", 0, "Manual weight override for Path 1 (0 = dynamic auto-weight)")
+	p2WeightFlag := flag.Int("p2-weight", 0, "Manual weight override for Path 2 (0 = dynamic auto-weight)")
 	flag.Parse()
 
 	if runtime.GOOS != "windows" {
@@ -119,7 +123,13 @@ func main() {
 
 	// 5. Initialize Components: Scheduler, ReorderBuffer, RouteManager
 	sched := scheduler.NewScheduler()
-	reorderBuf := reorder.NewReorderBuffer(40*time.Millisecond, 1)
+	for _, p := range tm.Paths() {
+		initW := getPathBaselineWeight(p, *p1WeightFlag, *p2WeightFlag)
+		sched.SetManualWeight(p.PathID, initW)
+		fmt.Printf("[SCHEDULER] Path %d (%s) initialized with baseline weight %d\n",
+			p.PathID, p.Interface.Name, initW)
+	}
+	reorderBuf := reorder.NewReorderBuffer(250*time.Millisecond, 1)
 	routeMgr := routing.NewRouteManager()
 	var metrics ClientMetrics
 
@@ -233,6 +243,7 @@ func main() {
 					for _, ipPkt := range inOrder {
 						wn, err := vAdapter.Write(ipPkt)
 						if err == nil {
+							atomic.AddUint64(&metrics.IPBytesToWintun, uint64(wn))
 							delivered := atomic.AddUint64(&metrics.IPPacketsToWintun, 1)
 							if delivered <= 10 || delivered%25 == 0 {
 								fmt.Printf("[%s] DATA In: Delivered %d bytes to Wintun (Total delivered: %d)\n",
@@ -377,7 +388,9 @@ func main() {
 					st, srtt, loss, consec, available := p.Health.QualityMetrics()
 					w := uint8(0)
 					if available {
-						w = uint8(scheduler.CalculateWeightWithQuality(st, srtt, loss, consec))
+						baseW := getPathBaselineWeight(p, *p1WeightFlag, *p2WeightFlag)
+						w = uint8(scheduler.CalculateWeightWithManual(st, srtt, loss, consec, baseW))
+						sched.SetManualWeight(p.PathID, int(w))
 					}
 
 					kp := protocol.NewV2Packet(protocol.PacketTypeKeepalive, tm.SessionID(), p.PathID, seq, []byte{w}, psk)
@@ -402,7 +415,7 @@ func main() {
 		}
 	}()
 
-	// Reorder Buffer High-Frequency Gap Flush Loop (10ms ticker, 40ms timeout)
+	// Reorder Buffer High-Frequency Gap Flush Loop (10ms ticker, 250ms timeout)
 	go func() {
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
@@ -416,6 +429,7 @@ func main() {
 				for _, ipPkt := range flushed {
 					wn, err := vAdapter.Write(ipPkt)
 					if err == nil {
+						atomic.AddUint64(&metrics.IPBytesToWintun, uint64(wn))
 						delivered := atomic.AddUint64(&metrics.IPPacketsToWintun, 1)
 						if delivered <= 10 || delivered%50 == 0 {
 							fmt.Printf("[%s] DATA In (Gap Flush): Delivered %d bytes to Wintun (Total: %d)\n",
@@ -446,6 +460,7 @@ func main() {
 			}
 
 			atomic.AddUint64(&metrics.IPPacketsFromWintun, 1)
+			atomic.AddUint64(&metrics.IPBytesFromWintun, uint64(n))
 
 			// Select active path via scheduler
 			selectedPath := sched.SelectPath(tm.Paths())
@@ -512,6 +527,8 @@ func main() {
 	var lastStatusTime time.Time = time.Now()
 	var lastTxBytes uint64
 	var lastRxBytes uint64
+	var lastWintunInBytes uint64
+	var lastWintunOutBytes uint64
 	lastPathTxBytes := make(map[uint8]uint64)
 	lastPathRxBytes := make(map[uint8]uint64)
 
@@ -534,6 +551,7 @@ func main() {
 				weight     int
 				txB        uint64
 				txP        uint64
+				assigned   uint64
 				rxB        uint64
 				rxP        uint64
 				qDepth     int
@@ -548,9 +566,16 @@ func main() {
 				st, srtt, loss, consec, available := p.Health.QualityMetrics()
 				w := 0
 				if available {
-					w = scheduler.CalculateWeightWithQuality(st, srtt, loss, consec)
+					manualW := 0
+					if p.PathID == 1 && *p1WeightFlag > 0 {
+						manualW = *p1WeightFlag
+					} else if p.PathID == 2 && *p2WeightFlag > 0 {
+						manualW = *p2WeightFlag
+					}
+					w = scheduler.CalculateWeightWithManual(st, srtt, loss, consec, manualW)
 				}
 				txB, txP, rxB, rxP := p.TrafficStats()
+				assigned := p.PacketsAssigned()
 				totalTxBytes += txB
 				totalTxPkts += txP
 				totalRxBytes += rxB
@@ -571,6 +596,7 @@ func main() {
 					weight:     w,
 					txB:        txB,
 					txP:        txP,
+					assigned:   assigned,
 					rxB:        rxB,
 					rxP:        rxP,
 					qDepth:     p.TxQueueDepth(),
@@ -583,18 +609,26 @@ func main() {
 			rxRateMbps := float64((totalRxBytes-lastRxBytes)*8) / (elapsed * 1_000_000)
 			lastTxBytes = totalTxBytes
 			lastRxBytes = totalRxBytes
+
+			currWintunInBytes := atomic.LoadUint64(&metrics.IPBytesFromWintun)
+			currWintunOutBytes := atomic.LoadUint64(&metrics.IPBytesToWintun)
+			wintunInRateMbps := float64((currWintunInBytes-lastWintunInBytes)*8) / (elapsed * 1_000_000)
+			wintunOutRateMbps := float64((currWintunOutBytes-lastWintunOutBytes)*8) / (elapsed * 1_000_000)
+			lastWintunInBytes = currWintunInBytes
+			lastWintunOutBytes = currWintunOutBytes
+
 			lastStatusTime = now
 
 			rStats := reorderBuf.Stats()
 
 			fmt.Println("--------------------------------------------------------------------------------")
-			fmt.Printf("[%s] BONDING STATUS | Agg TX: %5.2f Mbps | Agg RX: %5.2f Mbps\n",
-				now.Format("15:04:05"), txRateMbps, rxRateMbps)
+			fmt.Printf("[%s] BONDING STATUS | Wire Agg: TX %5.2f Mbps, RX %5.2f Mbps | Wintun: TX %5.2f Mbps, RX %5.2f Mbps\n",
+				now.Format("15:04:05"), txRateMbps, rxRateMbps, wintunInRateMbps, wintunOutRateMbps)
 
 			var pathDetails []string
 			for _, pi := range pathsInfo {
-				pathDetails = append(pathDetails, fmt.Sprintf("P%d(%s): %-8s RTT=%5.1fms Loss=%4.1f%% W=%-2d Q=%d/512",
-					pi.p.PathID, pi.p.Interface.Name, pi.st, float64(pi.srtt.Milliseconds()), pi.loss, pi.weight, pi.qDepth))
+				pathDetails = append(pathDetails, fmt.Sprintf("P%d(%s): %-8s RTT=%5.1fms Loss=%4.1f%% W=%-2d TX=%5.2fM RX=%5.2fM Q=%d/512 (Sent=%d, Assigned=%d)",
+					pi.p.PathID, pi.p.Interface.Name, pi.st, float64(pi.srtt.Milliseconds()), pi.loss, pi.weight, pi.txRateMbps, pi.rxRateMbps, pi.qDepth, pi.txP, pi.assigned))
 			}
 			fmt.Printf("  PATHS: %s\n", strings.Join(pathDetails, " | "))
 
@@ -604,8 +638,8 @@ func main() {
 				if totalTxBytes > 0 {
 					share = float64(pi.txB) / float64(totalTxBytes) * 100.0
 				}
-				txParts = append(txParts, fmt.Sprintf("P%d: %s (%d pkts, %4.1f%%, %5.2f Mbps)",
-					pi.p.PathID, formatBytes(pi.txB), pi.txP, share, pi.txRateMbps))
+				txParts = append(txParts, fmt.Sprintf("P%d: %s (%d sent, %d assigned, %4.1f%%, %5.2f Mbps)",
+					pi.p.PathID, formatBytes(pi.txB), pi.txP, pi.assigned, share, pi.txRateMbps))
 			}
 			fmt.Printf("  TX:    %s (%d pkts) | %s\n", formatBytes(totalTxBytes), totalTxPkts, strings.Join(txParts, " | "))
 
@@ -620,7 +654,7 @@ func main() {
 			}
 			fmt.Printf("  RX:    %s (%d pkts) | %s\n", formatBytes(totalRxBytes), totalRxPkts, strings.Join(rxParts, " | "))
 
-			fmt.Printf("  QUEUE: Reorder(Q=%d, Recv=%d, Reord=%d, Drop=%d, Dupl=%d, Deliv=%d) | Wintun(In=%d, Out=%d, Drops=%d)\n",
+			fmt.Printf("  QUEUE: Reorder(Q=%d, Recv=%d, Reord=%d, Drop=%d, Dupl=%d, Deliv=%d) | Wintun(In=%d pkts, Out=%d pkts, Drops=%d)\n",
 				rStats.QueueDepth, rStats.Received, rStats.Reordered, rStats.Dropped, rStats.Duplicates, rStats.Delivered,
 				atomic.LoadUint64(&metrics.IPPacketsFromWintun),
 				atomic.LoadUint64(&metrics.IPPacketsToWintun),
@@ -642,4 +676,29 @@ func formatBytes(b uint64) string {
 	default:
 		return fmt.Sprintf("%d B", b)
 	}
+}
+
+// getPathBaselineWeight determines the appropriate baseline weight for an interface.
+// Respects manual overrides if configured. For auto-mode: cellular tethering (Remote NDIS / Mobile)
+// gets weight 1 to prevent queue saturation, while Wi-Fi and wired Gigabit Ethernet get weight 10.
+func getPathBaselineWeight(p *tunnel.ManagedPath, p1W int, p2W int) int {
+	if p == nil {
+		return 1
+	}
+	if p.PathID == 1 && p1W > 0 {
+		return p1W
+	}
+	if p.PathID == 2 && p2W > 0 {
+		return p2W
+	}
+	descLower := strings.ToLower(p.Interface.Description)
+	nameLower := strings.ToLower(p.Interface.Name)
+	isCellular := strings.Contains(descLower, "remote ndis") ||
+		strings.Contains(descLower, "cellular") ||
+		strings.Contains(descLower, "mobile") ||
+		strings.Contains(nameLower, "cellular")
+	if isCellular {
+		return 1
+	}
+	return 10
 }

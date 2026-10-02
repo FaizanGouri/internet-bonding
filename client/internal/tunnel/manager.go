@@ -33,15 +33,16 @@ type TxItem struct {
 
 // ManagedPath represents an interface-agnostic physical tunnel path within a bonding session.
 type ManagedPath struct {
-	PathID      uint8
-	Interface   adapter.NetworkInterface
-	Tunnel      *ClientTunnel
-	Health      *PathHealth
-	seqNum      uint32
-	bytesSent   uint64
-	packetsSent uint64
-	bytesRecv   uint64
-	packetsRecv uint64
+	PathID          uint8
+	Interface       adapter.NetworkInterface
+	Tunnel          *ClientTunnel
+	Health          *PathHealth
+	seqNum          uint32
+	bytesSent       uint64
+	packetsSent     uint64
+	packetsAssigned uint64
+	bytesRecv       uint64
+	packetsRecv     uint64
 
 	txQueue    chan TxItem
 	workerStop chan struct{}
@@ -157,6 +158,11 @@ func (mp *ManagedPath) TxQueueDepth() int {
 	return len(mp.txQueue)
 }
 
+// PacketsAssigned returns the total number of packets queued to this path.
+func (mp *ManagedPath) PacketsAssigned() uint64 {
+	return atomic.LoadUint64(&mp.packetsAssigned)
+}
+
 // TryEnqueueTx attempts non-blocking submission of a packet to this path's worker queue.
 // Returns false if queue is saturated or worker is not running.
 func (mp *ManagedPath) TryEnqueueTx(raw []byte, size int, seq uint32) bool {
@@ -165,6 +171,7 @@ func (mp *ManagedPath) TryEnqueueTx(raw []byte, size int, seq uint32) bool {
 	}
 	select {
 	case mp.txQueue <- TxItem{Raw: raw, Size: size, Seq: seq}:
+		atomic.AddUint64(&mp.packetsAssigned, 1)
 		return true
 	default:
 		return false
@@ -178,6 +185,7 @@ func (mp *ManagedPath) EnqueueTxOrBlock(raw []byte, size int, seq uint32, timeou
 	}
 	select {
 	case mp.txQueue <- TxItem{Raw: raw, Size: size, Seq: seq}:
+		atomic.AddUint64(&mp.packetsAssigned, 1)
 		return true
 	case <-time.After(timeout):
 		return false
