@@ -25,6 +25,7 @@ const (
 	PacketTypeEcho         uint8 = 2
 	PacketTypeKeepalive    uint8 = 3
 	PacketTypeKeepaliveAck uint8 = 4
+	PacketTypeData         uint8 = 5 // Phase 3C (Real IP Traffic)
 
 	// Header sizes
 	MinPacketSize = 22 // Version 1 base size (Phase 3A backward compatibility)
@@ -111,6 +112,11 @@ func NewV2Packet(pktType uint8, sessionID uint64, pathID uint8, seqNum uint32, p
 		AuthTag:   tag,
 		Payload:   payload,
 	}
+}
+
+// NewDataPacket constructs an authenticated Phase 3C Data packet carrying an IP datagram.
+func NewDataPacket(sessionID uint64, pathID uint8, seqNum uint32, payload []byte, key []byte) *Packet {
+	return NewV2Packet(PacketTypeData, sessionID, pathID, seqNum, payload, key)
 }
 
 // MarshalBinary serializes the packet into wire format based on its Version.

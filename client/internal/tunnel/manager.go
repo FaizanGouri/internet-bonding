@@ -26,15 +26,55 @@ func GenerateSessionID() uint64 {
 
 // ManagedPath represents an interface-agnostic physical tunnel path within a bonding session.
 type ManagedPath struct {
-	PathID    uint8
-	Interface adapter.NetworkInterface
-	Tunnel    *ClientTunnel
-	Health    *PathHealth
-	seqNum    uint32
+	PathID      uint8
+	Interface   adapter.NetworkInterface
+	Tunnel      *ClientTunnel
+	Health      *PathHealth
+	seqNum      uint32
+	bytesSent   uint64
+	packetsSent uint64
+	bytesRecv   uint64
+	packetsRecv uint64
 }
 
 func (mp *ManagedPath) NextSeq() uint32 {
 	return atomic.AddUint32(&mp.seqNum, 1)
+}
+
+// RecordTx increments per-path transmitted bytes and packets.
+func (mp *ManagedPath) RecordTx(bytes int) {
+	atomic.AddUint64(&mp.bytesSent, uint64(bytes))
+	atomic.AddUint64(&mp.packetsSent, 1)
+}
+
+// RecordRx increments per-path received bytes and packets.
+func (mp *ManagedPath) RecordRx(bytes int) {
+	atomic.AddUint64(&mp.bytesRecv, uint64(bytes))
+	atomic.AddUint64(&mp.packetsRecv, 1)
+}
+
+// TrafficStats returns atomic snapshots of transmitted and received traffic on this path.
+func (mp *ManagedPath) TrafficStats() (txBytes, txPkts, rxBytes, rxPkts uint64) {
+	return atomic.LoadUint64(&mp.bytesSent),
+		atomic.LoadUint64(&mp.packetsSent),
+		atomic.LoadUint64(&mp.bytesRecv),
+		atomic.LoadUint64(&mp.packetsRecv)
+}
+
+// PacketConn returns the underlying packet socket connection, if open.
+func (mp *ManagedPath) PacketConn() net.PacketConn {
+	if mp.Tunnel != nil {
+		return mp.Tunnel.PacketConn()
+	}
+	return nil
+}
+
+// WriteRaw transmits raw packet bytes directly to the remote endpoint.
+func (mp *ManagedPath) WriteRaw(data []byte, addr *net.UDPAddr) (int, error) {
+	if mp.Tunnel == nil || mp.Tunnel.conn == nil {
+		return 0, fmt.Errorf("path %d socket not bound", mp.PathID)
+	}
+	return mp.Tunnel.conn.WriteTo(data, addr)
 }
 
 // TunnelManager coordinates multiple dynamic physical tunnels under a unified SessionID.
@@ -97,6 +137,16 @@ func NewTunnelManager(candidates []adapter.NetworkInterface, remoteAddr *net.UDP
 // SessionID returns the active 64-bit session identifier.
 func (tm *TunnelManager) SessionID() uint64 {
 	return tm.sessionID
+}
+
+// RemoteAddr returns the configured VPS address.
+func (tm *TunnelManager) RemoteAddr() *net.UDPAddr {
+	return tm.remoteAddr
+}
+
+// PSK returns the pre-shared key.
+func (tm *TunnelManager) PSK() []byte {
+	return tm.psk
 }
 
 // Paths returns a list of all managed paths.

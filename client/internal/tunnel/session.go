@@ -25,6 +25,8 @@ type PathHealth struct {
 	InterfaceName        string
 	IfIndex              uint32
 	LocalIP              net.IP
+	PhysicallyAvailable  bool
+	PhysicalReason       string
 	Status               PathStatus
 	SRTT                 time.Duration
 	Jitter               time.Duration
@@ -39,23 +41,76 @@ type PathHealth struct {
 // NewPathHealth initializes health tracking for a physical interface path.
 func NewPathHealth(pathID uint8, name string, ifIndex uint32, localIP net.IP) *PathHealth {
 	return &PathHealth{
-		PathID:        pathID,
-		InterfaceName: name,
-		IfIndex:       ifIndex,
-		LocalIP:       localIP,
-		Status:        StatusStandby,
-		RecentSamples: make([]bool, 0, 20),
+		PathID:              pathID,
+		InterfaceName:       name,
+		IfIndex:             ifIndex,
+		LocalIP:             localIP,
+		Status:              StatusStandby,
+		PhysicallyAvailable: true,
+		PhysicalReason:      "operational",
+		RecentSamples:       make([]bool, 0, 20),
 	}
 }
 
-// RecordProbeResult updates path health metrics and executes state transitions.
-func (ph *PathHealth) RecordProbeResult(success bool, rtt time.Duration, err error) {
+// SetPhysicalState updates the OS-level adapter presence and link state.
+// If an adapter becomes unavailable, its status immediately transitions to StatusDown.
+// When an adapter becomes available again, its status remains StatusDown (or StatusStandby)
+// until normal probe health checks succeed.
+func (ph *PathHealth) SetPhysicalState(available bool, reason string) (bool, PathStatus, PathStatus) {
 	ph.mu.Lock()
 	defer ph.mu.Unlock()
 
+	oldAvail := ph.PhysicallyAvailable
+	oldStatus := ph.Status
+	ph.PhysicallyAvailable = available
+	ph.PhysicalReason = reason
+
+	if !available {
+		if ph.Status != StatusDown {
+			ph.Status = StatusDown
+			ph.ConsecutiveSuccesses = 0
+			ph.LastError = reason
+			return true, oldStatus, StatusDown
+		}
+		return false, oldStatus, ph.Status
+	}
+
+	// Restored to available: clear stale health history so past disconnect losses do not penalize recovered path
+	if !oldAvail && available {
+		ph.RecentSamples = ph.RecentSamples[:0]
+		ph.LossPercent = 0.0
+		ph.SRTT = 0
+		ph.Jitter = 0
+		ph.ConsecutiveSuccesses = 0
+		ph.ConsecutiveFailures = 0
+		ph.LastError = ""
+	}
+
+	return false, oldStatus, ph.Status
+}
+
+// IsPhysicallyAvailable returns whether the OS reports the adapter as operational.
+func (ph *PathHealth) IsPhysicallyAvailable() bool {
+	ph.mu.RLock()
+	defer ph.mu.RUnlock()
+	return ph.PhysicallyAvailable
+}
+
+// RecordProbeResult updates path health metrics and executes state transitions.
+func (ph *PathHealth) RecordProbeResult(success bool, rtt time.Duration, err error) (bool, PathStatus, PathStatus) {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+
+	oldStatus := ph.Status
 	ph.LastProbeTime = time.Now()
 
-	// 1. Maintain rolling 20-sample window
+	// 1. If physically unavailable in OS, force StatusDown regardless of probe outcomes
+	if !ph.PhysicallyAvailable {
+		ph.Status = StatusDown
+		return (ph.Status != oldStatus), oldStatus, ph.Status
+	}
+
+	// 2. Maintain rolling 20-sample window
 	if len(ph.RecentSamples) >= 20 {
 		ph.RecentSamples = ph.RecentSamples[1:]
 	}
@@ -94,7 +149,7 @@ func (ph *PathHealth) RecordProbeResult(success bool, rtt time.Duration, err err
 		}
 	}
 
-	// 2. Deterministic State Machine Transitions
+	// 3. Deterministic State Machine Transitions
 	switch ph.Status {
 	case StatusStandby:
 		if success {
@@ -119,8 +174,12 @@ func (ph *PathHealth) RecordProbeResult(success bool, rtt time.Duration, err err
 		// Recovery requires 3 consecutive successful keepalives
 		if ph.ConsecutiveSuccesses >= 3 {
 			ph.Status = StatusUp
+			ph.LossPercent = 0.0
+			ph.RecentSamples = []bool{true, true, true}
 		}
 	}
+
+	return (ph.Status != oldStatus), oldStatus, ph.Status
 }
 
 // Snapshot returns a copy of the current path state.
@@ -128,6 +187,20 @@ func (ph *PathHealth) Snapshot() (PathStatus, time.Duration, float64, time.Durat
 	ph.mu.RLock()
 	defer ph.mu.RUnlock()
 	return ph.Status, ph.SRTT, ph.LossPercent, ph.Jitter
+}
+
+// SchedulingMetrics returns the operational status, smoothed RTT, and consecutive successes for traffic scheduling.
+func (ph *PathHealth) SchedulingMetrics() (PathStatus, time.Duration, int) {
+	ph.mu.RLock()
+	defer ph.mu.RUnlock()
+	return ph.Status, ph.SRTT, ph.ConsecutiveSuccesses
+}
+
+// QualityMetrics returns status, smoothed RTT, loss percentage, consecutive successes, and physical availability.
+func (ph *PathHealth) QualityMetrics() (status PathStatus, srtt time.Duration, loss float64, consec int, available bool) {
+	ph.mu.RLock()
+	defer ph.mu.RUnlock()
+	return ph.Status, ph.SRTT, ph.LossPercent, ph.ConsecutiveSuccesses, ph.PhysicallyAvailable
 }
 
 func (ph *PathHealth) String() string {

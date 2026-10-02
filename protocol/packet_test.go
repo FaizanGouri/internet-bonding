@@ -116,3 +116,39 @@ func TestPacketV2_TamperedHMACRejection(t *testing.T) {
 		t.Errorf("Expected HMAC verification to fail with wrong key")
 	}
 }
+
+func TestPacketV2_DataPacket(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	sessionID := uint64(0xAABBCCDDEEFF0011)
+	pathID := uint8(1)
+	seqNum := uint32(500)
+	// Simulated IPv4 header + ICMP echo payload (60 bytes)
+	ipPayload := make([]byte, 60)
+	ipPayload[0] = 0x45 // IPv4, IHL=5
+	ipPayload[9] = 0x01 // Protocol=ICMP
+
+	pkt := NewDataPacket(sessionID, pathID, seqNum, ipPayload, key)
+	if pkt.Type != PacketTypeData {
+		t.Errorf("Type = %d; want %d", pkt.Type, PacketTypeData)
+	}
+
+	data, err := pkt.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary failed: %v", err)
+	}
+
+	var parsed Packet
+	if err := parsed.UnmarshalBinary(data); err != nil {
+		t.Fatalf("UnmarshalBinary failed: %v", err)
+	}
+
+	if parsed.Type != PacketTypeData {
+		t.Errorf("Parsed Type = %d; want %d", parsed.Type, PacketTypeData)
+	}
+	if !VerifyAuthTag(key, &parsed) {
+		t.Errorf("HMAC verification failed for Data packet")
+	}
+	if len(parsed.Payload) != 60 || parsed.Payload[0] != 0x45 {
+		t.Errorf("Payload corrupted or truncated")
+	}
+}

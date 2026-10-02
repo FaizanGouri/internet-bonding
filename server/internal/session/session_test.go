@@ -128,3 +128,93 @@ func TestSessionTable_InvalidHMAC_SecurityEnforcement(t *testing.T) {
 		t.Errorf("SecurityDropCount = %d; want %d", st.SecurityDropCount(), initialDropCount+2)
 	}
 }
+
+func TestSessionTable_SelectDownstreamPath_RoundRobin(t *testing.T) {
+	st := NewSessionTable()
+	psk := []byte("0123456789abcdef0123456789abcdef")
+	sessionID := uint64(0x1122334455667788)
+
+	addr1 := &net.UDPAddr{IP: net.ParseIP("192.168.1.100"), Port: 50001}
+	addr2 := &net.UDPAddr{IP: net.ParseIP("192.168.2.100"), Port: 50002}
+
+	// Register P1 and P2
+	pkt1 := protocol.NewV2Packet(protocol.PacketTypeKeepalive, sessionID, 1, 1, nil, psk)
+	_, _ = st.ProcessPacket(pkt1, addr1, psk)
+
+	pkt2 := protocol.NewV2Packet(protocol.PacketTypeKeepalive, sessionID, 2, 1, nil, psk)
+	_, _ = st.ProcessPacket(pkt2, addr2, psk)
+
+	// Should round-robin across both active paths: P1, P2, P1, P2
+	expectedPIDs := []uint8{1, 2, 1, 2}
+	for i, wantPID := range expectedPIDs {
+		pid, ep, err := st.SelectDownstreamPath(sessionID)
+		if err != nil {
+			t.Fatalf("Iteration %d: SelectDownstreamPath failed: %v", i, err)
+		}
+		if pid != wantPID {
+			t.Errorf("Iteration %d: got PathID %d, want %d", i, pid, wantPID)
+		}
+		if (wantPID == 1 && ep.String() != addr1.String()) || (wantPID == 2 && ep.String() != addr2.String()) {
+			t.Errorf("Iteration %d: unexpected endpoint %v for path %d", i, ep, wantPID)
+		}
+	}
+
+	// Test RecordDownstreamTx
+	st.RecordDownstreamTx(sessionID, 1, 1400)
+}
+
+func TestSessionTable_DownstreamSWRR_WeightFeedback(t *testing.T) {
+	st := NewSessionTable()
+	psk := []byte("0123456789abcdef0123456789abcdef")
+	sessionID := uint64(0x9988776655443322)
+
+	addr1 := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 40001}
+	addr2 := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 40002}
+
+	// 1. P1 reports weight 2, P2 reports weight 1 in keepalive payload
+	kp1 := protocol.NewV2Packet(protocol.PacketTypeKeepalive, sessionID, 1, 1, []byte{2}, psk)
+	_, _ = st.ProcessPacket(kp1, addr1, psk)
+
+	kp2 := protocol.NewV2Packet(protocol.PacketTypeKeepalive, sessionID, 2, 1, []byte{1}, psk)
+	_, _ = st.ProcessPacket(kp2, addr2, psk)
+
+	// SWRR with weights 2:1 over 3 iterations should yield: P1, P2, P1
+	expected := []uint8{1, 2, 1}
+	for i, wantPID := range expected {
+		pid, _, err := st.SelectDownstreamPath(sessionID)
+		if err != nil {
+			t.Fatalf("Iteration %d: SelectDownstreamPath failed: %v", i, err)
+		}
+		if pid != wantPID {
+			t.Errorf("Iteration %d: got PathID %d, want %d", i, pid, wantPID)
+		}
+	}
+
+	// 2. P2 reports weight 0 (path DOWN)
+	kp2Down := protocol.NewV2Packet(protocol.PacketTypeKeepalive, sessionID, 2, 2, []byte{0}, psk)
+	_, _ = st.ProcessPacket(kp2Down, addr2, psk)
+
+	// Now only P1 should be selected
+	for i := 0; i < 5; i++ {
+		pid, _, err := st.SelectDownstreamPath(sessionID)
+		if err != nil {
+			t.Fatalf("P1 only: SelectDownstreamPath failed: %v", err)
+		}
+		if pid != 1 {
+			t.Errorf("P1 only: got PathID %d, want 1", pid)
+		}
+	}
+
+	// 3. P2 recovers with slow-start weight 1
+	kp2Up := protocol.NewV2Packet(protocol.PacketTypeKeepalive, sessionID, 2, 3, []byte{1}, psk)
+	_, _ = st.ProcessPacket(kp2Up, addr2, psk)
+
+	pCounts := make(map[uint8]int)
+	for i := 0; i < 6; i++ {
+		pid, _, _ := st.SelectDownstreamPath(sessionID)
+		pCounts[pid]++
+	}
+	if pCounts[1] == 0 || pCounts[2] == 0 {
+		t.Errorf("Expected both P1 and P2 to receive traffic after recovery, got counts: %v", pCounts)
+	}
+}

@@ -63,6 +63,11 @@ func (t *ClientTunnel) RemoteAddr() *net.UDPAddr {
 	return t.cfg.RemoteAddr
 }
 
+// PacketConn returns the underlying packet socket connection.
+func (t *ClientTunnel) PacketConn() net.PacketConn {
+	return t.conn
+}
+
 // SendProbe transmits a test packet and waits synchronously for the echo response.
 func (t *ClientTunnel) SendProbe(seqNum uint32, payload []byte) (*protocol.Packet, time.Duration, error) {
 	pkt := protocol.NewProbePacket(seqNum, payload)
