@@ -1,0 +1,43 @@
+# Go binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Build/output
+bin/
+dist/
+build/
+out/
+
+# Test/coverage
+*.test
+coverage.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Environment/secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Local scratch files
+scratch_*.go
+check_*.go
