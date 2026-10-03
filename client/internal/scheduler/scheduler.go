@@ -88,22 +88,26 @@ func CalculateWeightWithQuality(status tunnel.PathStatus, srtt time.Duration, lo
 			return 5 // Default weight for fresh healthy path
 		}
 		ms := float64(srtt.Milliseconds())
-		if ms < 10 {
-			ms = 10
+		if ms < 5 {
+			ms = 5
 		}
 		var base int
-		if ms <= 180 {
+		if ms <= 50 {
 			base = 10
-		} else if ms <= 240 {
+		} else if ms <= 90 {
+			base = 8
+		} else if ms <= 140 {
+			base = 5
+		} else if ms <= 200 {
 			base = 3
-		} else {
-			// Higher latency mobile/cellular link (> 240ms)
-			// Safe baseline is weight 1 to prevent bufferbloat and Head-of-Line blocking on fast Wi-Fi
+		} else if ms <= 280 {
 			base = 1
+		} else {
+			base = 0
 		}
 
 		// Account for packet loss if present (e.g. 5% loss reduces capacity factor)
-		if lossPercent > 0 {
+		if lossPercent > 0 && base > 0 {
 			factor := 1.0 - (lossPercent / 100.0)
 			if factor < 0.2 {
 				factor = 0.2
@@ -117,7 +121,7 @@ func CalculateWeightWithQuality(status tunnel.PathStatus, srtt time.Duration, lo
 		// Intermediate ramp-up stage (consecutiveSuccesses 6..9): scale to half weight
 		if consecutiveSuccesses > 0 && consecutiveSuccesses < 10 {
 			half := base / 2
-			if half < 1 {
+			if half < 1 && base > 0 {
 				half = 1
 			}
 			return half

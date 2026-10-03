@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,7 +26,7 @@ import (
 	"internet-bonding/reorder"
 )
 
-const ProbeTimeoutThreshold = 2500 * time.Millisecond
+const ProbeTimeoutThreshold = 1500 * time.Millisecond
 
 type ClientMetrics struct {
 	IPPacketsFromWintun uint64
@@ -102,6 +103,23 @@ func main() {
 		log.Fatalf("No active physical network interfaces found")
 	}
 
+	// Deterministic interface ordering: Wi-Fi always Path 1, Ethernet/Cellular Path 2
+	sort.Slice(candidates, func(i, j int) bool {
+		iIsWifi := strings.Contains(strings.ToLower(candidates[i].Name), "wi-fi") ||
+			strings.Contains(strings.ToLower(candidates[i].Description), "wi-fi") ||
+			strings.Contains(strings.ToLower(candidates[i].Description), "wireless")
+		jIsWifi := strings.Contains(strings.ToLower(candidates[j].Name), "wi-fi") ||
+			strings.Contains(strings.ToLower(candidates[j].Description), "wi-fi") ||
+			strings.Contains(strings.ToLower(candidates[j].Description), "wireless")
+		if iIsWifi && !jIsWifi {
+			return true
+		}
+		if !iIsWifi && jIsWifi {
+			return false
+		}
+		return candidates[i].Index < candidates[j].Index
+	})
+
 	fmt.Printf("Detected %d active physical interface(s):\n", len(candidates))
 	for i, c := range candidates {
 		fmt.Printf("  [Path %d] %s (Index: %d, IP: %s, Gateway: %s)\n",
@@ -116,20 +134,25 @@ func main() {
 	}
 	defer tm.Close()
 
-	// Start asynchronous per-path transmit workers (512 packet queue capacity each)
-	tm.StartAllTxWorkers(512)
+	// Start asynchronous per-path transmit workers (1024 packet queue capacity each)
+	tm.StartAllTxWorkers(1024)
 
 	fmt.Printf("Session Established: SessionID=0x%016X\n", tm.SessionID())
 
 	// 5. Initialize Components: Scheduler, ReorderBuffer, RouteManager
 	sched := scheduler.NewScheduler()
 	for _, p := range tm.Paths() {
-		initW := getPathBaselineWeight(p, *p1WeightFlag, *p2WeightFlag)
-		sched.SetManualWeight(p.PathID, initW)
-		fmt.Printf("[SCHEDULER] Path %d (%s) initialized with baseline weight %d\n",
-			p.PathID, p.Interface.Name, initW)
+		if p.PathID == 1 && *p1WeightFlag > 0 {
+			sched.SetManualWeight(1, *p1WeightFlag)
+			fmt.Printf("[SCHEDULER] Path 1 (%s) manual weight override: %d\n", p.Interface.Name, *p1WeightFlag)
+		} else if p.PathID == 2 && *p2WeightFlag > 0 {
+			sched.SetManualWeight(2, *p2WeightFlag)
+			fmt.Printf("[SCHEDULER] Path 2 (%s) manual weight override: %d\n", p.Interface.Name, *p2WeightFlag)
+		} else {
+			fmt.Printf("[SCHEDULER] Path %d (%s) dynamic quality-based scheduling enabled\n", p.PathID, p.Interface.Name)
+		}
 	}
-	reorderBuf := reorder.NewReorderBuffer(250*time.Millisecond, 1)
+	reorderBuf := reorder.NewReorderBuffer(350*time.Millisecond, 1)
 	routeMgr := routing.NewRouteManager()
 	var metrics ClientMetrics
 
@@ -345,7 +368,7 @@ func main() {
 
 	// 11. Background Keepalive Prober, Probe Timeout Checker & Gap Timer
 	go func() {
-		ticker := time.NewTicker(1000 * time.Millisecond)
+		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
 
 		for {
@@ -388,9 +411,13 @@ func main() {
 					st, srtt, loss, consec, available := p.Health.QualityMetrics()
 					w := uint8(0)
 					if available {
-						baseW := getPathBaselineWeight(p, *p1WeightFlag, *p2WeightFlag)
-						w = uint8(scheduler.CalculateWeightWithManual(st, srtt, loss, consec, baseW))
-						sched.SetManualWeight(p.PathID, int(w))
+						manualW := 0
+						if p.PathID == 1 && *p1WeightFlag > 0 {
+							manualW = *p1WeightFlag
+						} else if p.PathID == 2 && *p2WeightFlag > 0 {
+							manualW = *p2WeightFlag
+						}
+						w = uint8(scheduler.CalculateWeightWithManual(st, srtt, loss, consec, manualW))
 					}
 
 					kp := protocol.NewV2Packet(protocol.PacketTypeKeepalive, tm.SessionID(), p.PathID, seq, []byte{w}, psk)
@@ -679,8 +706,9 @@ func formatBytes(b uint64) string {
 }
 
 // getPathBaselineWeight determines the appropriate baseline weight for an interface.
-// Respects manual overrides if configured. For auto-mode: cellular tethering (Remote NDIS / Mobile)
-// gets weight 1 to prevent queue saturation, while Wi-Fi and wired Gigabit Ethernet get weight 10.
+// Respects manual overrides if configured.
+// Wi-Fi is identified by interface name/description and given baseline weight 10.
+// Ethernet / Cellular is given balanced weight 6 so it contributes strong throughput without choking Wi-Fi.
 func getPathBaselineWeight(p *tunnel.ManagedPath, p1W int, p2W int) int {
 	if p == nil {
 		return 1
@@ -691,14 +719,15 @@ func getPathBaselineWeight(p *tunnel.ManagedPath, p1W int, p2W int) int {
 	if p.PathID == 2 && p2W > 0 {
 		return p2W
 	}
-	descLower := strings.ToLower(p.Interface.Description)
 	nameLower := strings.ToLower(p.Interface.Name)
-	isCellular := strings.Contains(descLower, "remote ndis") ||
-		strings.Contains(descLower, "cellular") ||
-		strings.Contains(descLower, "mobile") ||
-		strings.Contains(nameLower, "cellular")
-	if isCellular {
-		return 1
+	descLower := strings.ToLower(p.Interface.Description)
+	isWifi := strings.Contains(nameLower, "wi-fi") ||
+		strings.Contains(descLower, "wi-fi") ||
+		strings.Contains(descLower, "wireless")
+
+	if isWifi {
+		return 10
 	}
-	return 10
+	// Ethernet / Secondary Path (Weight 6: allows 15-25 Mbps without throttling Wi-Fi)
+	return 6
 }
